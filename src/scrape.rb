@@ -3,7 +3,7 @@ require "open-uri"
 
 class Movie
   attr_accessor :image_url, :studio, :year, :director, :summary, :full_title, :title, :actors,
-                :runtime, :genre, :mpaa
+                :runtime, :genres, :mpaa
 end
 
 CD_REGEX = /\s*-\s*cd(\d)\.[^.]+$/i
@@ -253,7 +253,15 @@ class Scraper
   end
 
   def alt_texts(text)
-    return [text, text.gsub(/\.\.\./, ' ')]
+    return [
+      text,
+      text.gsub(/\.\.\./, ' '),
+      text.gsub(/ – /, ' '),
+      text.gsub(/ - /, ' '),       # different -
+      text.gsub(/,/, ''),
+      text.gsub(/'/, ''),
+      text.gsub(/ - /, ' ').gsub(/"/, '')
+    ]
   end
 
   def include_one_of?(texts, terms)
@@ -335,7 +343,9 @@ class Scraper
   def download_image_new_tab(url)
     open_tab()
     @browser.get(url)
-    return download_image('img')
+    path = download_image('img')
+    close_tab()
+    return path
   end
 
   def download_image_auto(url)
@@ -371,6 +381,10 @@ class Scraper
         score = 100 - candi.length
         # more score for short one (more important than first one)
         score += 100 - elem.text.length * 2
+        # less score for 2
+        if elem.text =~ /#{s_term} (\d|ii|iii)/i
+          score -= 100
+        end
         # more score for gallery
         link = elem.find_element(xpath: '../../div/div/div/cite')
         href = link.text
@@ -378,6 +392,11 @@ class Scraper
           if href.include?('/galleries/')
             score += 5
           end
+          if href =~ /^promo/ || href =~ /\/tag/ || href =~ /^m\./ || href =~ /\/cover/ || href =~ /^fhg/ ||
+            href =~ /\/blog/ || href =~ /\/user/ || href =~ /sexart.+gallery/
+            score -= 100
+          end
+
           # avoid beta and hosted
           if /^beta/ =~ href || /^hosted/ =~ href || /^dev/ =~ href || /^branch/ =~ href
             next
@@ -432,6 +451,12 @@ class Scraper
   </actor>
 END_ACTOR
     end
+
+    genres = ''
+    movie.genres.each do |genre|
+      genres += "  <genre>#{genre}</genre>\n"
+    end
+
     nfo = path.sub(/\.[^.]+$/, '.nfo')
     open(nfo, 'w') do |file|
       file.puts <<-END_NFO
@@ -441,7 +466,7 @@ END_ACTOR
   <plot>#{escape(movie.summary)}</plot>
   <runtime>#{movie.runtime}</runtime>
   <director>#{movie.director}</director>
-  <genre>#{movie.genre}</genre>
+#{genres}
   <studio>#{movie.studio}</studio>
   <mpaa>#{movie.mpaa}</mpaa>
 #{actors}
@@ -464,7 +489,7 @@ END_NFO
         end
         movie.studio = ''
         movie.title = find_element('//*[@id="center-main"]/h1').text.sub(/ DVD$/, '') + extra_name(path)
-        movie.genre = ''
+        movie.genres = []
         movie.mpaa = 'X'
         find_elements('//*[@id="center-main"]/div[2]/div/div/div[2]/form/table[1]/tbody/tr/td/p').each do |elem|
           if !movie.summary
@@ -508,22 +533,30 @@ END_NFO
         movie.title = find_element('/html/body/table[3]/tbody/tr/td/table[1]/tbody/tr/td[2]/span').text + extra
         movie.actors = find_elements('/html/body/table[3]/tbody/tr/td/table[1]/tbody/tr/td[2]/table[1]/tbody/tr/td/div/span/a/u').map { |elem| elem.text }
         movie.runtime = find_element('/html/body/table[3]/tbody/tr/td/table[1]/tbody/tr/td[2]/table[2]/tbody/tr[1]/td[2]').text
-        movie.genre = find_element('/html/body/table[3]/tbody/tr/td/table[1]/tbody/tr/td[2]/table[2]/tbody/tr[5]/td[2]').text
+        movie.genres = [find_element('/html/body/table[3]/tbody/tr/td/table[1]/tbody/tr/td[2]/table[2]/tbody/tr[5]/td[2]').text]
         movie.mpaa = 'X'
       end
     end
   end
 
   def scrape_james_deen(path)
-    scrape_internal(path, 'james deen', 'jamesdeenproductions.com') do |movie|
+    candi = candidates_from_google(search_term(path), 'jamesdeenproductions.com')
+    if candi.empty?
+      print_line(RED, " ⇨ can't find")
+      return
+    end
+    scrape_internal(path, candi) do |movie|
       image = find_element('img.attachment-product-image.wp-post-image')
 
       movie.image_url = image.attribute('src')
       movie.studio = 'James Deen Productions'
-      movie.year = nil
-      movie.director = nil
+      movie.year = ''
+      movie.director = ''
       movie.summary = find_element('/html/body/div[1]/div/main/section/div/div/div[1]/p[2]').text
-      movie.full_title = 'James Deen - ' + title_from(path)
+      movie.title = find_element('body > div.wrapper > div > main > section > div > div > div:nth-child(1) > h3:nth-child(1)')
+      movie.actors = find_elements('body > div.wrapper > div > main > section > div > div > div:nth-child(1) > p.meta > a').map { |elem| elem.text }
+      movie.genres = []
+      movie.mpaa = 'X'
     end
   end
 
@@ -540,6 +573,7 @@ END_NFO
         movie.year = $1
       end
       movie.actors = find_elements('//*[@id="content"]/ul/li[2]/a').map { |elem| elem.text }
+      movie.genres = []
       movie.mpaa = 'X'
 
       if find_element('img.gallery-cover')
@@ -558,31 +592,91 @@ END_NFO
   end
 
   def scrape_wowgirls(path)
-    
+    candi = candidates_from_google(search_term(path), 'wowgirls.tv')
+    if candi.empty?
+      print_line(RED, " ⇨ can't find")
+      return
+    end
+    scrape_internal(path, candi) do |movie|
+      movie.title = find_element('#entries > div.entry.post.clearfix > h1').text
+      movie.studio = 'WowGirls'
+      meta = find_element('#entries > div.entry.post.clearfix > div.post-meta > p').text
+      if / \d\d, (\d\d\d\d)/ =~ meta
+        movie.year = $1
+      end
+      if /Featuring (.+) in: (.+)/ =~ meta
+        movie.actors = [$1]
+        movie.genres = $2.split(',').map { |genre| genre.strip() }
+      end
+      movie.mpaa = 'X'
+      value = find_element('#kt_player_internal > param:nth-child(5)').attribute('value')
+      value.split('&').each do |v|
+        pair = v.split('=')
+        if pair[0] == 'preview_url'
+          movie.image_url = URI.unescape(pair[1])
+          break
+        end
+      end
+      movie.summary = find_text('#entries > div.entry.post.clearfix > p:nth-child(15)')
+    end
   end
 
   def scrape_joy_mii(path)
-    scrape_internal(path, 'joymii', 'joymii.com/site/set-video') do |movie|
-      sleep(1)
+    candi = candidates_from_google(search_term(path), 'joymii.com/site/set-video')
+    if candi.empty?
+      print_line(RED, " ⇨ can't find")
+      return
+    end
+    scrape_internal(path, candi) do |movie|
       image = find_element('div.video-container > div.video-js', '#video-placeholder > img.poster')
       url = image.attribute('poster')
       if !url
         url = image.attribute('src')
       end
-      download_image_new_tab(url)
-      movie.image_url = "file://#{Dir.home}/Downloads/temp.jpg"
+      movie.image_url = download_image_new_tab(url)
       movie.studio = 'JoyMii'
       movie.summary = find_element('div.info > p.text').text
-      title = find_element('h1.title').text
-      actors = find_elements('h2.starring-models > a').map { |elem| elem.text }.join(', ')
-      movie.full_title = "JoyMii - #{actors} - #{title}"
+      movie.title = find_element('h1.title').text
+      movie.actors = find_elements('h2.starring-models > a').map { |elem| elem.text }
+      movie.genres = []
+      movie.year = ''
+      movie.mpaa = 'X'
+    end
+  end
+
+  def scrape_sexart(path)
+    candi = candidates_from_google(search_term(path), 'sexart.com')
+    if candi.empty?
+      print_line(RED, " ⇨ can't find")
+      return
+    end
+    scrape_internal(path, candi) do |movie|
+      movie.image_url = find_element('img.cover').attribute('src')
+      movie.studio = 'SexArt'
+      movie.summary = find_element('div.custom-description-short > p').text.sub(/Synopsis: /, '')
+      movie.title = find_element('a.gallery-title').text
+      movie.actors = find_elements('div.details.font-13.v-offset-30 > ul > li:nth-child(1) > span:nth-child(2) > span > a').map { |elem| elem.text }
+      movie.genres = find_elements('div.tags.v-offset-30 > div > ul > li > a').map { |elem| elem.text }
+      if find_element('div.details.font-13.v-offset-30 > ul > li:nth-child(2)').text =~ /\d\d\d\d/
+        movie.year = $&
+      end
+      movie.mpaa = 'X'
+      if find_element('div.details.font-13.v-offset-30 > ul > li:nth-child(3)').text =~ /\d\d:\d\d/
+        movie.runtime = $&
+      end
+      director = find_element('div.details.font-13.v-offset-30 > ul > li:nth-child(4) > span:nth-child(2) > span')
+      if director
+        movie.director = director.text
+      else
+        movie.director = ''
+      end
     end
   end
 
   def scrape_newsensations(path)
     candi = candidates_from_google(dash_part(path, -1), 'newsensations.com')
     scrape_internal(path, candi) do |movie|
-      movie.title = find_element('//*[@id="container"]/table/tbody/tr/td/table/tbody/tr[2]/td/form/table/tbody/tr/td/table/tbody/tr/td/table/tbody/tr/td/table/tbody/tr/td/table/tbody/tr/td/table/tbody/tr[2]/td/table/tbody/tr/td/table/tbody/tr/td[3]/div/table/tbody/tr/td/div/h1').text
+      movie.title = find_element('#container > table > tbody > tr > td > table > tbody > tr:nth-child(2) > td > form > table > tbody > tr > td > table > tbody > tr > td > table > tbody > tr > td > table > tbody > tr > td > table > tbody > tr > td > table > tbody > tr:nth-child(2) > td > table > tbody > tr > td > table > tbody > tr > td:nth-child(3) > div > table > tbody > tr > td > div > h1').text
       text = find_element('//*[@id="container"]/table/tbody/tr/td/table/tbody/tr[2]/td/form/table/tbody/tr/td/table/tbody/tr/td/table/tbody/tr/td/table/tbody/tr/td/table/tbody/tr/td/table/tbody/tr[2]/td/table/tbody/tr/td/table/tbody/tr/td[3]/div/table/tbody/tr/td/div/div[2]/table/tbody/tr[1]/td').text
       texts = text.split('Starring: ')
       movie.summary = texts[0]
@@ -593,11 +687,11 @@ END_NFO
       /\d\d-\d\d-(\d\d\d\d)/ =~ date
       movie.year = $1
       movie.studio = find_element('//*[@id="container"]/table/tbody/tr/td/table/tbody/tr[2]/td/form/table/tbody/tr/td/table/tbody/tr/td/table/tbody/tr/td/table/tbody/tr/td/table/tbody/tr/td/table/tbody/tr[2]/td/table/tbody/tr/td/table/tbody/tr/td[3]/div/table/tbody/tr/td/div/span/a').text
+      movie.genres = []
       movie.mpaa = 'X'
 
       movie.image_url = download_image('#productinfo_bigimage')
     end
-    exit
   end
 
   def scrape_file(path)
@@ -607,10 +701,10 @@ END_NFO
       scrape_x_art(path)
     elsif path =~ /\/wowgirls/i
       scrape_wowgirls(path)
-    elsif path =~ /james deen/i
-      scrape_james_deen(path)
     elsif path =~ /joymii/i
       scrape_joy_mii(path)
+    elsif path =~ /sexart/i
+      scrape_sexart(path)
     elsif path =~ /newsensations/i
       scrape_newsensations(path)
     else
